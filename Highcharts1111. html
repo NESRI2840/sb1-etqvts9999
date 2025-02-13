@@ -1,0 +1,488 @@
+// trade.service.ts
+@Injectable({ providedIn: 'root' })
+export class TradeService {
+  private apiUrl = '/api/trades';
+
+  constructor(
+    private http: HttpClient,
+    private walletService: WalletService,
+    private stockService: StockService
+  ) {}
+
+  async executeTrade(order: TradeOrder): Promise<boolean> {
+    try {
+      // Validate funds and holdings
+      const valid = await this.validateOrder(order);
+      if (!valid) return false;
+
+      // Execute trade
+      await lastValueFrom(
+        this.http.post(this.apiUrl, order).pipe(
+          tap(() => this.updateWallet(order))
+        )
+      );
+      return true;
+    } catch (error) {
+      console.error('Trade failed:', error);
+      return false;
+    }
+  }
+
+  private async validateOrder(order: TradeOrder): Promise<boolean> {
+    const [balance, holdings] = await Promise.all([
+      lastValueFrom(this.walletService.balance$),
+      lastValueFrom(this.walletService.holdings$)
+    ]);
+
+    const totalCost = order.quantity * order.price;
+    
+    if (order.type === 'BUY') {
+      return totalCost <= balance;
+    } else {
+      return (holdings[order.symbol]?.quantity || 0) >= order.quantity;
+    }
+  }
+
+  private updateWallet(order: TradeOrder): void {
+    const amount = order.quantity * order.price;
+    
+    if (order.type === 'BUY') {
+      this.walletService.updateBalance(-amount);
+      this.walletService.updateHoldings(order.symbol, order.quantity, order.price);
+    } else {
+      this.walletService.updateBalance(amount);
+      this.walletService.updateHoldings(order.symbol, -order.quantity);
+    }
+  }
+}
+
+///components 
+
+// trade.component.ts
+import { Component, OnInit, OnDestroy } from '@angular/core';
+import { FormBuilder, FormGroup, Validators } from '@angular/forms';
+import { ActivatedRoute, Router } from '@angular/router';
+import { StockService } from '../services/stock.service';
+import { TradeService, TradeOrder } from '../services/trade.service';
+import { WalletService } from '../services/wallet.service';
+import { Subject, takeUntil } from 'rxjs';
+
+@Component({
+  selector: 'app-trade',
+  templateUrl: './trade.component.html',
+  styleUrls: ['./trade.component.css']
+})
+export class TradeComponent implements OnInit, OnDestroy {
+  stock!: StockModel;
+  orderSide: 'BUY' | 'SELL' = 'BUY';
+  currentPrice = 0;
+  priceChange = 0;
+  lastUpdated = new Date();
+  availableFunds = 0;
+  availableShares = 0;
+  private destroy$ = new Subject<void>();
+
+  tradeForm: FormGroup;
+  isProcessing = false;
+
+  constructor(
+    private route: ActivatedRoute,
+    private router: Router,
+    private fb: FormBuilder,
+    private stockService: StockService,
+    private tradeService: TradeService,
+    private walletService: WalletService
+  ) {
+    this.tradeForm = this.fb.group({
+      orderType: ['MARKET', Validators.required],
+      quantity: [1, [Validators.required, Validators.min(1)]),
+      price: [null],
+      stopPrice: [null]
+    });
+  }
+
+  ngOnInit() {
+    const symbol = this.route.snapshot.paramMap.get('symbol')!;
+    this.orderSide = this.route.snapshot.queryParams['action'].toUpperCase();
+
+    // Load real-time price data
+    this.stockService.getRealTimePrice(symbol)
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(priceData => {
+        this.currentPrice = priceData.price;
+        this.priceChange = priceData.changePercent;
+        this.lastUpdated = new Date();
+        this.updateValidation();
+      });
+
+    // Load wallet data
+    this.walletService.balance$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(balance => this.availableFunds = balance);
+
+    this.walletService.holdings$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(holdings => {
+        this.availableShares = holdings[symbol]?.quantity || 0;
+      });
+
+    this.setupFormListeners();
+  }
+
+  private setupFormListeners() {
+    this.tradeForm.get('orderType')?.valueChanges
+      .subscribe(() => this.updatePriceValidation());
+
+    this.tradeForm.get('quantity')?.valueChanges
+      .subscribe(() => this.updateValidation());
+  }
+
+  get showPriceFields() {
+    return this.tradeForm.value.orderType !== 'MARKET';
+  }
+
+  get showLimitPrice() {
+    return ['LIMIT', 'STOP_LIMIT'].includes(this.tradeForm.value.orderType);
+  }
+
+  get showStopPrice() {
+    return ['STOP', 'STOP_LIMIT'].includes(this.tradeForm.value.orderType);
+  }
+
+  get priceComparisonText() {
+    if (!this.tradeForm.value.price) return '';
+    const enteredPrice = this.tradeForm.value.price;
+    return enteredPrice > this.currentPrice ? 'Above Market' : 'Below Market';
+  }
+
+  get priceChangeClass() {
+    return this.priceChange >= 0 ? 'positive' : 'negative';
+  }
+
+  updatePriceValidation() {
+    const priceControl = this.tradeForm.get('price');
+    if (this.showLimitPrice) {
+      priceControl?.setValidators([
+        Validators.required,
+        Validators.min(0.01),
+        this.validateLimitPrice.bind(this)
+      ]);
+    } else {
+      priceControl?.clearValidators();
+    }
+    priceControl?.updateValueAndValidity();
+  }
+
+  validateLimitPrice(control: any) {
+    const enteredPrice = control.value;
+    if (!enteredPrice) return null;
+
+    if (this.orderSide === 'BUY' && enteredPrice > this.currentPrice) {
+      return { priceTooHigh: true };
+    }
+    if (this.orderSide === 'SELL' && enteredPrice < this.currentPrice) {
+      return { priceTooLow: true };
+    }
+    return null;
+  }
+
+  calculateOrderValue() {
+    const quantity = this.tradeForm.value.quantity || 0;
+    const price = this.tradeForm.value.price || this.currentPrice;
+    return quantity * price;
+  }
+
+  async submitOrder() {
+    if (this.tradeForm.invalid) return;
+
+    const order: TradeOrder = {
+      symbol: this.stock.symbol,
+      type: this.tradeForm.value.orderType,
+      side: this.orderSide,
+      quantity: this.tradeForm.value.quantity,
+      price: this.tradeForm.value.price,
+      stopPrice: this.tradeForm.value.stopPrice,
+      timestamp: new Date()
+    };
+
+    this.isProcessing = true;
+    try {
+      const success = await this.tradeService.executeTrade(order);
+      if (success) {
+        this.router.navigate(['/portfolio']);
+      }
+    } catch (error) {
+      console.error('Trade failed:', error);
+    } finally {
+      this.isProcessing = false;
+    }
+  }
+
+  ngOnDestroy() {
+    this.destroy$.next();
+    this.destroy$.complete();
+  }
+}
+
+////Trade html
+
+<!-- trade.component.html -->
+<mat-card class="trade-card">
+  <mat-card-header>
+    <mat-card-title>
+      <mat-icon>swap_vert</mat-icon>
+      {{ orderSide }} {{ stock?.symbol }}
+    </mat-card-title>
+    <mat-card-subtitle>
+      <div class="price-ticker">
+        <span class="price" [ngClass]="priceChangeClass">
+          {{ currentPrice | currency }}
+        </span>
+        <span class="change" [ngClass]="priceChangeClass">
+          ({{ priceChange | number:'1.2-2' }}%)
+        </span>
+        <span class="timestamp">
+          As of {{ lastUpdated | date:'HH:mm:ss' }}
+        </span>
+      </div>
+    </mat-card-subtitle>
+  </mat-card-header>
+
+  <mat-card-content>
+    <form [formGroup]="tradeForm" (ngSubmit)="submitOrder()">
+      <!-- Order Type Selector -->
+      <mat-form-field appearance="outline">
+        <mat-label>Order Type</mat-label>
+        <mat-select formControlName="orderType" (selectionChange)="updatePriceValidation()">
+          <mat-option value="MARKET">Market Order</mat-option>
+          <mat-option value="LIMIT">Limit Order</mat-option>
+          <mat-option value="STOP">Stop Order</mat-option>
+        </mat-select>
+      </mat-form-field>
+
+      <!-- Price Inputs -->
+      <div class="price-inputs" *ngIf="showPriceFields">
+        <mat-form-field appearance="outline" *ngIf="showLimitPrice">
+          <mat-label>{{ orderSide }} Price</mat-label>
+          <input matInput type="number" formControlName="price" 
+                 [placeholder]="getPricePlaceholder()">
+          <mat-hint>
+            Current: {{ currentPrice | currency }}
+            <span [hidden]="!showPriceWarning" class="price-warning">
+              ({{ priceComparisonText }})
+            </span>
+          </mat-hint>
+        </mat-form-field>
+
+        <mat-form-field appearance="outline" *ngIf="showStopPrice">
+          <mat-label>Stop Price</mat-label>
+          <input matInput type="number" formControlName="stopPrice">
+          <mat-hint>Trigger price for stop orders</mat-hint>
+        </mat-form-field>
+      </div>
+
+      <!-- Quantity Input -->
+      <mat-form-field appearance="outline">
+        <mat-label>Quantity</mat-label>
+        <input matInput type="number" formControlName="quantity" 
+               min="1" step="1" (change)="updateValidation()">
+        <mat-hint>
+          Available {{ orderSide === 'BUY' ? 'funds' : 'shares' }}: 
+          {{ orderSide === 'BUY' ? (availableFunds | currency) : availableShares }}
+        </mat-hint>
+      </mat-form-field>
+
+      <!-- Order Summary -->
+      <div class="order-summary">
+        <div class="summary-item">
+          <span>Order Value:</span>
+          <span>{{ calculateOrderValue() | currency }}</span>
+        </div>
+        <div class="summary-item">
+          <span>Estimated {{ orderSide === 'BUY' ? 'Cost' : 'Proceeds' }}:</span>
+          <span [ngClass]="{
+            'positive': orderSide === 'SELL',
+            'negative': orderSide === 'BUY'
+          }">
+            {{ calculateOrderValue() | currency }}
+          </span>
+        </div>
+      </div>
+
+      <button mat-raised-button 
+              [color]="orderSide === 'BUY' ? 'primary' : 'warn'"
+              type="submit"
+              [disabled]="tradeForm.invalid || isProcessing">
+        {{ orderSide }} {{ quantity }} Shares
+        <mat-icon *ngIf="isProcessing">
+          <mat-spinner diameter="20"></mat-spinner>
+        </mat-icon>
+      </button>
+    </form>
+  </mat-card-content>
+</mat-card>
+////wallet 
+// wallet.service.ts
+@Injectable({ providedIn: 'root' })
+export class WalletService {
+  private balanceSubject = new BehaviorSubject<number>(100000);
+  private holdingsSubject = new BehaviorSubject<Holdings>({});
+
+  balance$ = this.balanceSubject.asObservable();
+  holdings$ = this.holdingsSubject.asObservable();
+
+  updateBalance(amount: number): void {
+    this.balanceSubject.next(this.balanceSubject.value + amount);
+  }
+
+  updateHoldings(symbol: string, quantity: number, price?: number): void {
+    const holdings = { ...this.holdingsSubject.value };
+    const current = holdings[symbol] || { quantity: 0, avgPrice: 0 };
+
+    if (quantity > 0) { // Buy
+      const totalQty = current.quantity + quantity;
+      const newAvg = ((current.quantity * current.avgPrice) + (quantity * price!)) / totalQty;
+      holdings[symbol] = { quantity: totalQty, avgPrice: newAvg };
+    } else { // Sell
+      holdings[symbol].quantity += quantity;
+      if (holdings[symbol].quantity <= 0) delete holdings[symbol];
+    }
+
+    this.holdingsSubject.next(holdings);
+  }
+}
+///html part
+<!-- wallet.component.html -->
+<mat-card class="wallet-card">
+  <mat-card-header>
+    <mat-card-title>
+      <mat-icon>account_balance</mat-icon>
+      Portfolio Overview
+    </mat-card-title>
+  </mat-card-header>
+
+  <mat-card-content>
+    <div class="balance-section">
+      <h2>Available Funds: {{ balance | currency }}</h2>
+      <div class="total-value">
+        <h3>Portfolio Value: {{ totalValue | currency }}</h3>
+      </div>
+    </div>
+
+    <mat-table [dataSource]="holdings">
+      <!-- Table columns same as before -->
+    </mat-table>
+  </mat-card-content>
+</mat-card>
+
+//ts part
+
+// wallet.component.ts
+import { Component, OnInit } from '@angular/core';
+import { WalletService } from '../services/wallet.service';
+import { MatTableDataSource } from '@angular/material/table';
+
+interface HoldingDisplay {
+  symbol: string;
+  quantity: number;
+  averagePrice: number;
+  currentPrice: number;
+  value: number;
+}
+
+@Component({
+  selector: 'app-wallet',
+  templateUrl: './wallet.component.html',
+  styleUrls: ['./wallet.component.css']
+})
+export class WalletComponent implements OnInit {
+  balance = 0;
+  holdingsDataSource = new MatTableDataSource<HoldingDisplay>([]);
+  displayedColumns: string[] = ['symbol', 'quantity', 'averagePrice', 'currentPrice', 'value'];
+
+  constructor(private walletService: WalletService) {}
+
+  ngOnInit() {
+    this.walletService.balance$.subscribe(balance => this.balance = balance);
+    this.walletService.holdings$.subscribe(holdings => {
+      this.holdingsDataSource.data = this.processHoldings(holdings);
+    });
+  }
+
+  private processHoldings(holdings: { [key: string]: Holding }): HoldingDisplay[] {
+    return Object.entries(holdings).map(([symbol, holding]) => ({
+      symbol,
+      quantity: holding.quantity,
+      averagePrice: holding.averagePrice,
+      currentPrice: 0, // You would fetch this from stock service
+      value: holding.quantity * holding.averagePrice
+    }));
+  }
+
+  addFunds(amount: number): void {
+    this.walletService.addFunds(amount);
+  }
+}
+
+///First html 
+<!-- wallet.component.html -->
+<mat-card class="wallet-card">
+  <mat-card-header>
+    <mat-card-title>
+      <mat-icon>account_balance_wallet</mat-icon>
+      My Portfolio
+    </mat-card-title>
+  </mat-card-header>
+
+  <mat-card-content>
+    <div class="balance-section">
+      <h2>Available Balance: {{ balance | currency }}</h2>
+      <button mat-raised-button color="primary" (click)="addFunds(10000)">
+        <mat-icon>attach_money</mat-icon>
+        Add $10,000
+      </button>
+    </div>
+
+    <mat-table [dataSource]="holdingsDataSource" class="holdings-table">
+      <!-- Symbol Column -->
+      <ng-container matColumnDef="symbol">
+        <mat-header-cell *matHeaderCellDef> Symbol </mat-header-cell>
+        <mat-cell *matCellDef="let holding"> {{ holding.symbol }} </mat-cell>
+      </ng-container>
+
+      <!-- Quantity Column -->
+      <ng-container matColumnDef="quantity">
+        <mat-header-cell *matHeaderCellDef> Shares </mat-header-cell>
+        <mat-cell *matCellDef="let holding"> {{ holding.quantity }} </mat-cell>
+      </ng-container>
+
+      <!-- Average Price Column -->
+      <ng-container matColumnDef="averagePrice">
+        <mat-header-cell *matHeaderCellDef> Avg. Price </mat-header-cell>
+        <mat-cell *matCellDef="let holding"> 
+          {{ holding.averagePrice | currency }} 
+        </mat-cell>
+      </ng-container>
+
+      <!-- Current Price Column -->
+      <ng-container matColumnDef="currentPrice">
+        <mat-header-cell *matHeaderCellDef> Current Price </mat-header-cell>
+        <mat-cell *matCellDef="let holding"> 
+          {{ holding.currentPrice | currency }} 
+        </mat-cell>
+      </ng-container>
+
+      <!-- Value Column -->
+      <ng-container matColumnDef="value">
+        <mat-header-cell *matHeaderCellDef> Value </mat-header-cell>
+        <mat-cell *matCellDef="let holding"> 
+          {{ holding.value | currency }} 
+        </mat-cell>
+      </ng-container>
+
+      <mat-header-row *matHeaderRowDef="displayedColumns"></mat-header-row>
+      <mat-row *matRowDef="let row; columns: displayedColumns;"></mat-row>
+    </mat-table>
+  </mat-card-content>
+</mat-card>
+
