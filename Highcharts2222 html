@@ -1,0 +1,465 @@
+// src/app/models/transaction.model.ts export interface Transaction { id: string; type: 'TRANSFER' | 'TRADE'; subType: 'DEPOSIT' | 'WITHDRAWAL' | 'BUY' | 'SELL'; amount: number; currency: string; status: 'PENDING' | 'COMPLETED' | 'FAILED'; date: Date; description: string; bank?: { id: string; name: string; accountNumber: string; }; trade?: { symbol?: string; quantity?: number; price?: number; orderId?: string; }; } 
+
+// src/app/services/wallet.service.ts import { Injectable } from '@angular/core'; import { BehaviorSubject, Observable, of } from 'rxjs'; import { delay } from 'rxjs/operators'; import { Transaction } from '../models/transaction.model'; 
+
+@Injectable({ providedIn: 'root' }) export class WalletService { private balanceSubject = new BehaviorSubject(0); private transactionsSubject = new BehaviorSubject<Transaction[]>([]); 
+
+balance$ = this.balanceSubject.asObservable(); transactions$ = this.transactionsSubject.asObservable(); 
+
+processBankTransfer( amount: number, isDeposit: boolean, bankId: string, bankName: string, accountNumber: string ): Observable { const transaction: Transaction = { id: this.generateId(), type: 'TRANSFER', subType: isDeposit ? 'DEPOSIT' : 'WITHDRAWAL', amount: Math.abs(amount), currency: 'ETB', status: 'PENDING', date: new Date(), description: ${isDeposit ? 'Deposit to' : 'Withdrawal from'} ${bankName}, bank: { id: bankId, name: bankName, accountNumber } }; 
+
+return new Observable(subscriber => {
+this.addTransaction(transaction); 
+
+setTimeout(() => {
+try {
+if (!isDeposit && this.balanceSubject.value < amount) {
+throw new Error('Insufficient balance');
+} 
+
+const newBalance = isDeposit ? this.balanceSubject.value + amount : this.balanceSubject.value - amount; this.balanceSubject.next(newBalance); this.updateTransactionStatus(transaction.id, 'COMPLETED'); subscriber.next({ ...transaction, status: 'COMPLETED' }); } catch (error) { this.updateTransactionStatus(transaction.id, 'FAILED', error.message); subscriber.error(error); } finally { subscriber.complete(); } 
+
+}, 2000);
+}); 
+
+} 
+
+processTradeTransaction( amount: number, subType: 'BUY' | 'SELL', symbol: string, quantity: number, price: number, orderId: string ): void { const transaction: Transaction = { id: this.generateId(), type: 'TRADE', subType, amount: Math.abs(amount), currency: 'ETB', status: 'COMPLETED', date: new Date(), description: ${subType} ${quantity} ${symbol} @ ${price}, trade: { symbol, quantity, price, orderId } }; 
+
+const newBalance = this.balanceSubject.value + (subType === 'SELL' ? amount : -amount);
+this.balanceSubject.next(newBalance);
+this.addTransaction(transaction); 
+
+} 
+
+private generateId(): string { return Date.now().toString(36) + Math.random().toString(36).substr(2, 5); } 
+
+private addTransaction(transaction: Transaction): void { this.transactionsSubject.next([...this.transactionsSubject.value, transaction]); } 
+
+private updateTransactionStatus(id: string, status: 'COMPLETED' | 'FAILED', error?: string): void { const transactions = this.transactionsSubject.value.map(t => { if (t.id === id) { return { ...t, status, description: error ? ${t.description} - ${error} : t.description }; } return t; }); this.transactionsSubject.next(transactions); } } 
+
+// src/app/wallet/wallet.component.ts import { Component, OnInit } from '@angular/core'; import { FormBuilder, FormGroup, Validators } from '@angular/forms'; import { WalletService } from '../services/wallet.service'; import { Transaction } from '../models/transaction.model'; 
+
+interface Bank { id: string; name: string; accountPattern: RegExp; accountExample: string; } 
+
+@Component({ selector: 'app-wallet', templateUrl: './wallet.component.html', styleUrls: ['./wallet.component.scss'] }) export class WalletComponent implements OnInit { transferForm: FormGroup; transactions: Transaction[] = []; filteredTransactions: Transaction[] = []; selectedType: 'all' | 'TRANSFER' | 'TRADE' = 'all'; searchQuery: string = ''; isProcessing: boolean = false; 
+
+banks: Bank[] = [ { id: 'CBE', name: 'Commercial Bank of Ethiopia', accountPattern: /^\d{13}$/, accountExample: '13 digits (e.g., 1000123456789)' }, { id: 'AWASH', name: 'Awash Bank', accountPattern: /^\d{10}$/, accountExample: '10 digits (e.g., 1234567890)' }, { id: 'ABYSSINIA', name: 'Bank of Abyssinia', accountPattern: /^\d{12}$/, accountExample: '12 digits (e.g., 123456789012)' }, { id: 'CBO', name: 'CBO Bank', accountPattern: /^\d{11}$/, accountExample: '11 digits (e.g., 12345678901)' } ]; 
+
+constructor( private fb: FormBuilder, private walletService: WalletService ) { this.transferForm = this.fb.group({ amount: [null, [Validators.required, Validators.min(100)]], bank: [null, Validators.required], accountNumber: [null, Validators.required], isDeposit: [true] }); } 
+
+ngOnInit(): void { this.walletService.transactions$.subscribe(transactions => { this.transactions = transactions; this.applyFilters(); }); 
+
+this.transferForm.get('bank')?.valueChanges.subscribe(bankId => {
+const bank = this.banks.find(b => b.id === bankId);
+if (bank) {
+this.transferForm.get('accountNumber')?.setValidators([
+Validators.required,
+Validators.pattern(bank.accountPattern)
+]);
+this.transferForm.get('accountNumber')?.updateValueAndValidity();
+}
+}); 
+
+} 
+
+get selectedBankExample(): string { const bankId = this.transferForm.get('bank')?.value; return this.banks.find(b => b.id === bankId)?.accountExample || ''; } 
+
+async submitTransfer(): Promise { if (this.transferForm.invalid) return; 
+
+this.isProcessing = true;
+try {
+const { amount, bank, accountNumber, isDeposit } = this.transferForm.value;
+const bankName = this.banks.find(b => b.id === bank)?.name || 'Unknown Bank'; 
+
+await this.walletService.processBankTransfer(
+amount,
+isDeposit,
+bank,
+bankName,
+accountNumber
+).toPromise(); 
+
+this.transferForm.reset({ isDeposit: true });
+} catch (error) {
+console.error('Transfer failed:', error);
+} finally {
+this.isProcessing = false;
+} 
+
+} 
+
+applyFilters(): void { this.filteredTransactions = this.transactions .filter(t => this.selectedType === 'all' || t.type === this.selectedType) .filter(t => this.matchesSearchQuery(t)) .sort((a, b) => b.date.getTime() - a.date.getTime()); } 
+
+private matchesSearchQuery(tx: Transaction): boolean { const query = this.searchQuery.toLowerCase(); return ( tx.description.toLowerCase().includes(query) || (tx.bank?.accountNumber.includes(query)) || (tx.trade?.symbol?.toLowerCase().includes(query)) || tx.id.includes(query) ); } } 
+
+Bank Transfers 
+
+ETB  Amount is required Minimum amount is 100 ETB Bank {{ bank.name }} Bank selection is required 
+
+<div class="form-row"> <mat-form-field appearance="outline"> <input matInput formControlName="accountNumber" [placeholder]="selectedBankExample || 'Account Number'"> <mat-hint *ngIf="selectedBankExample">{{ selectedBankExample }}</mat-hint> <mat-error *ngIf="transferForm.get('accountNumber')?.invalid"> Invalid account format </mat-error> </mat-form-field> <mat-radio-group formControlName="isDeposit"> <mat-radio-button [value]="true">Deposit</mat-radio-button> <mat-radio-button [value]="false">Withdraw</mat-radio-button> </mat-radio-group> </div> <button mat-raised-button color="primary" type="submit" [disabled]="transferForm.invalid || isProcessing"> {{ isProcessing ? 'Processing...' : 'Submit' }} </button> 
+
+
+
+Transaction History 
+
+Filter All Transactions Bank Transfers Trades <mat-form-field appearance="outline"> <input matInput [(ngModel)]="searchQuery" (ngModelChange)="applyFilters()" placeholder="Search..."> <mat-icon matPrefix>search</mat-icon> </mat-form-field> 
+
+{{ tx.date | date:'medium' }} {{ tx.status }} 
+
+<div class="details"> <div class="description">{{ tx.description }}</div> <div *ngIf="tx.bank" class="bank-info"> <mat-icon>account_balance</mat-icon> {{ tx.bank.name }} ({{ tx.bank.accountNumber }}) </div> <div *ngIf="tx.trade" class="trade-info"> <mat-icon>swap_horiz</mat-icon> {{ tx.trade.quantity }} shares @ {{ tx.trade.price | currency }} </div> </div> <div class="amount" [class.positive]="tx.subType === 'DEPOSIT' || tx.subType === 'SELL'" [class.negative]="tx.subType === 'WITHDRAWAL' || tx.subType === 'BUY'"> {{ (tx.subType === 'DEPOSIT' || tx.subType === 'SELL' ? '+' : '-') }} {{ tx.amount | currency:'ETB' }} </div> </div> 
+
+The above data is transaction model, wallet.service.ts, wallet component. Ts And wallet component. Html 
+
+I need full code like this updated version
+
+
+
+
+//__///
+
+
+
+<!-- src/app/wallet/wallet.component.html -->
+<div class="wallet-container">
+  <!-- Portfolio Summary Section -->
+  <mat-card class="summary-card">
+    <mat-card-header>
+      <mat-card-title>Portfolio Summary</mat-card-title>
+    </mat-card-header>
+    <mat-card-content>
+      <div class="summary-grid">
+        <div class="summary-item">
+          <h3>Cash Balance</h3>
+          <p>{{ (walletService.balance$ | async)?.cash | currency:'ETB' }}</p>
+        </div>
+        <div class="summary-item">
+          <h3>Investment Value</h3>
+          <p>{{ (walletService.balance$ | async)?.investmentValue | currency:'ETB' }}</p>
+        </div>
+        <div class="summary-item">
+          <h3>Total Value</h3>
+          <p class="total-value">{{ (walletService.balance$ | async)?.totalValue | currency:'ETB' }}</p>
+        </div>
+      </div>
+    </mat-card-content>
+  </mat-card> 
+
+  <!-- Holdings Table -->
+  <mat-card class="holdings-card">
+    <mat-card-header>
+      <mat-card-title>Stock Holdings</mat-card-title>
+    </mat-card-header>
+    <mat-card-content>
+      <table mat-table [dataSource]="(walletService.holdings$ | async)?.entries() || []" class="full-width">
+        <!-- Symbol Column -->
+        <ng-container matColumnDef="symbol">
+          <th mat-header-cell *matHeaderCellDef>Symbol</th>
+          <td mat-cell *matCellDef="let item">{{ item[0] }}</td>
+        </ng-container> 
+
+        <!-- Quantity Column -->
+        <ng-container matColumnDef="quantity">
+          <th mat-header-cell *matHeaderCellDef>Shares</th>
+          <td mat-cell *matCellDef="let item">{{ item[1].quantity }}</td>
+        </ng-container> 
+
+        <!-- Average Price Column -->
+        <ng-container matColumnDef="averagePrice">
+          <th mat-header-cell *matHeaderCellDef>Avg Cost</th>
+          <td mat-cell *matCellDef="let item">{{ item[1].averagePrice | currency:'ETB' }}</td>
+        </ng-container> 
+
+        <!-- Current Price Column -->
+        <ng-container matColumnDef="currentPrice">
+          <th mat-header-cell *matHeaderCellDef>Current Price</th>
+          <td mat-cell *matCellDef="let item">
+            {{ stockService.getCurrentPrice(item[0]) | currency:'ETB' }}
+          </td>
+        </ng-container> 
+
+        <!-- Value Column -->
+        <ng-container matColumnDef="value">
+          <th mat-header-cell *matHeaderCellDef>Current Value</th>
+          <td mat-cell *matCellDef="let item">
+            {{ item[1].quantity * stockService.getCurrentPrice(item[0]) | currency:'ETB' }}
+          </td>
+        </ng-container> 
+
+        <!-- P/L Column -->
+        <ng-container matColumnDef="pl">
+          <th mat-header-cell *matHeaderCellDef>Unrealized P/L</th>
+          <td mat-cell *matCellDef="let item" 
+              [class.profit]="(stockService.getCurrentPrice(item[0]) - item[1].averagePrice) > 0"
+              [class.loss]="(stockService.getCurrentPrice(item[0]) - item[1].averagePrice) < 0">
+            {{ (stockService.getCurrentPrice(item[0]) - item[1].averagePrice) * item[1].quantity | currency:'ETB' }}
+            ({{ ((stockService.getCurrentPrice(item[0]) / item[1].averagePrice - 1) * 100 | number:'1.2-2' }}%)
+          </td>
+        </ng-container> 
+
+        <tr mat-header-row *matHeaderRowDef="['symbol', 'quantity', 'averagePrice', 'currentPrice', 'value', 'pl']"></tr>
+        <tr mat-row *matRowDef="let row; columns: ['symbol', 'quantity', 'averagePrice', 'currentPrice', 'value', 'pl'];"></tr>
+      </table>
+    </mat-card-content>
+  </mat-card> 
+
+  <!-- Existing Bank Transfer Form -->
+  <mat-card class="transfer-card">
+    <div class="form-row"> <mat-form-field appearance="outline"> <input matInput formControlName="accountNumber" [placeholder]="selectedBankExample || 'Account Number'"> <mat-hint *ngIf="selectedBankExample">{{ selectedBankExample }}</mat-hint> <mat-error *ngIf="transferForm.get('accountNumber')?.invalid"> Invalid account format </mat-error> </mat-form-field> <mat-radio-group formControlName="isDeposit"> <mat-radio-button [value]="true">Deposit</mat-radio-button> <mat-radio-button [value]="false">Withdraw</mat-radio-button> </mat-radio-group> </div> <button mat-raised-button color="primary" type="submit" [disabled]="transferForm.invalid || isProcessing"> {{ isProcessing ? 'Processing...' : 'Submit' }} </button> 
+
+  </mat-card> 
+
+  <!-- Enhanced Transaction History -->
+  <mat-card class="history-card">
+    <mat-card-header>
+      <mat-card-title>Transaction History</mat-card-title>
+    </mat-card-header>
+    <mat-card-content>
+      <div class="filters">
+        <mat-form-field appearance="outline"> <input matInput [(ngModel)]="searchQuery" (ngModelChange)="applyFilters()" placeholder="Search..."> <mat-icon matPrefix>search</mat-icon> </mat-form-field> 
+
+{{ tx.date | date:'medium' }} {{ tx.status }} 
+      </div> 
+
+      <!-- Performance Metrics Section -->
+      <div class="performance-metrics">
+        <div class="metric">
+          <h4>Total Invested</h4>
+          <p>{{ (walletService.performance$ | async)?.totalInvested | currency:'ETB' }}</p>
+        </div>
+        <div class="metric">
+          <h4>Current Value</h4>
+          <p>{{ (walletService.performance$ | async)?.totalValue | currency:'ETB' }}</p>
+        </div>
+        <div class="metric">
+          <h4>Total Return</h4>
+          <p [class.profit]="(walletService.performance$ | async)?.unrealizedPL > 0"
+             [class.loss]="(walletService.performance$ | async)?.unrealizedPL < 0">
+            {{ (walletService.performance$ | async)?.unrealizedPL | currency:'ETB' }}
+          </p>
+        </div>
+      </div> 
+
+      <!-- Existing Transaction List -->
+      <div class="transaction-list">
+        <div class="details"> <div class="description">{{ tx.description }}</div> <div *ngIf="tx.bank" class="bank-info"> <mat-icon>account_balance</mat-icon> {{ tx.bank.name }} ({{ tx.bank.accountNumber }}) </div> <div *ngIf="tx.trade" class="trade-info"> <mat-icon>swap_horiz</mat-icon> {{ tx.trade.quantity }} shares @ {{ tx.trade.price | currency }} </div> </div> <div class="amount" [class.positive]="tx.subType === 'DEPOSIT' || tx.subType === 'SELL'" [class.negative]="tx.subType === 'WITHDRAWAL' || tx.subType === 'BUY'"> {{ (tx.subType === 'DEPOSIT' || tx.subType === 'SELL' ? '+' : '-') }} {{ tx.amount | currency:'ETB' }} </div> </div> 
+
+      </div>
+    </mat-card-content>
+  </mat-card>
+</div>
+
+
+///_ts part/ 
+
+// src/app/wallet/wallet.component.ts
+import { Component, OnInit } from '@angular/core';
+import { FormBuilder, FormGroup, Validators } from '@angular/forms';
+import { WalletService } from '../services/wallet.service';
+import { Transaction } from '../models/transaction.model';
+import { StockService } from '../services/stock.service'; 
+
+interface Bank {
+  id: string;
+  name: string;
+  accountPattern: RegExp;
+  accountExample: string;
+} 
+
+@Component({
+  selector: 'app-wallet',
+  templateUrl: './wallet.component.html',
+  styleUrls: ['./wallet.component.scss']
+})
+export class WalletComponent implements OnInit {
+  // Existing properties remain
+  holdings: Array<[string, Holding]> = [];
+  performanceMetrics?: PerformanceMetrics; 
+
+  constructor(
+    private fb: FormBuilder,
+    private walletService: WalletService,
+    public stockService: StockService
+  ) {
+    // Existing constructor code
+  } 
+
+  ngOnInit(): void {
+    // Existing subscriptions
+    this.walletService.holdings$.subscribe(holdings => {
+      this.holdings = Array.from(holdings.entries());
+    }); 
+
+    this.walletService.performance$.subscribe(metrics => {
+      this.performanceMetrics = metrics;
+    });
+  } 
+
+  getCurrentValue(symbol: string): number {
+    return this.stockService.getCurrentPrice(symbol);
+  } 
+
+  getUnrealizedPL(symbol: string, averagePrice: number, quantity: number): number {
+    const currentPrice = this.stockService.getCurrentPrice(symbol);
+    return (currentPrice - averagePrice) * quantity;
+  } 
+
+  getReturnPercentage(averagePrice: number, currentPrice: number): number {
+    return ((currentPrice - averagePrice) / averagePrice) * 100;
+  } 
+
+  // Existing methods remain unchanged
+  // ...
+}
+
+
+//// wallet service 
+
+
+// src/app/services/wallet.service.ts
+import { Injectable } from '@angular/core';
+import { BehaviorSubject, Observable, of } from 'rxjs';
+import { delay } from 'rxjs/operators';
+import { Transaction } from '../models/transaction.model';
+import { StockService } from './stock.service'; 
+
+interface Holding {
+  quantity: number;
+  totalInvested: number;
+  averagePrice: number;
+} 
+
+interface PerformanceMetrics {
+  totalValue: number;
+  totalInvested: number;
+  unrealizedPL: number;
+} 
+
+@Injectable({ providedIn: 'root' })
+export class WalletService {
+  private balanceSubject = new BehaviorSubject<number>(100000);
+  private holdingsSubject = new BehaviorSubject<Map<string, Holding>>(new Map());
+  private transactionsSubject = new BehaviorSubject<Transaction[]>([]);
+  private performanceSubject = new BehaviorSubject<PerformanceMetrics>({
+    totalValue: 100000,
+    totalInvested: 0,
+    unrealizedPL: 0
+  }); 
+
+  balance$ = this.balanceSubject.asObservable();
+  holdings$ = this.holdingsSubject.asObservable();
+  transactions$ = this.transactionsSubject.asObservable();
+  performance$ = this.performanceSubject.asObservable(); 
+
+  constructor(private stockService: StockService) {
+    this.stockService.getPriceUpdates().subscribe(prices => {
+      this.updateHoldingsValues(prices);
+    });
+  } 
+
+  processBankTransfer(
+    amount: number,
+    isDeposit: boolean,
+    bankId: string,
+    bankName: string,
+    accountNumber: string
+  ): Observable<Transaction> {
+    // Existing bank transfer logic remains same
+    // ...
+  } 
+
+  processTradeTransaction(
+    amount: number,
+    subType: 'BUY' | 'SELL',
+    symbol: string,
+    quantity: number,
+    price: number,
+    orderId: string
+  ): void {
+    // Update holdings
+    if (subType === 'BUY') {
+      this.addHolding(symbol, quantity, price);
+    } else {
+      this.removeHolding(symbol, quantity, price);
+    } 
+
+    // Update balance and transactions
+    const newBalance = this.balanceSubject.value + (subType === 'SELL' ? amount : -amount);
+    this.balanceSubject.next(newBalance);
+    
+    const transaction: Transaction = {
+      id: this.generateId(),
+      type: 'TRADE',
+      subType,
+      amount: Math.abs(amount),
+      currency: 'ETB',
+      status: 'COMPLETED',
+      date: new Date(),
+      description: `${subType} ${quantity} ${symbol} @ ${price}`,
+      trade: { symbol, quantity, price, orderId }
+    };
+    
+    this.addTransaction(transaction);
+    this.calculatePerformance();
+  } 
+
+  private addHolding(symbol: string, quantity: number, price: number): void {
+    const holdings = new Map(this.holdingsSubject.value);
+    const existing = holdings.get(symbol) || { quantity: 0, totalInvested: 0, averagePrice: 0 };
+    
+    const newHolding = {
+      quantity: existing.quantity + quantity,
+      totalInvested: existing.totalInvested + (quantity * price),
+      averagePrice: (existing.totalInvested + (quantity * price)) / (existing.quantity + quantity)
+    };
+    
+    holdings.set(symbol, newHolding);
+    this.holdingsSubject.next(holdings);
+  } 
+
+  private removeHolding(symbol: string, quantity: number, price: number): void {
+    const holdings = new Map(this.holdingsSubject.value);
+    const existing = holdings.get(symbol);
+    
+    if (!existing) return; 
+
+    const newHolding = {
+      quantity: existing.quantity - quantity,
+      totalInvested: existing.totalInvested - (quantity * existing.averagePrice),
+      averagePrice: existing.averagePrice
+    };
+    
+    if (newHolding.quantity <= 0) {
+      holdings.delete(symbol);
+    } else {
+      holdings.set(symbol, newHolding);
+    }
+    
+    this.holdingsSubject.next(holdings);
+  } 
+
+  private updateHoldingsValues(prices: { [symbol: string]: number }): void {
+    const holdings = new Map(this.holdingsSubject.value);
+    let totalInvested = 0;
+    let currentValue = 0; 
+
+    holdings.forEach((holding, symbol) => {
+      totalInvested += holding.totalInvested;
+      currentValue += holding.quantity * (prices[symbol] || 0);
+    }); 
+
+    this.performanceSubject.next({
+      totalValue: this.balanceSubject.value + currentValue,
+      totalInvested,
+      unrealizedPL: currentValue - totalInvested
+    });
+  } 
+
+  private calculatePerformance(): void {
+    const prices = this.stockService.getAllPrices();
+    this.updateHoldingsValues(prices);
+  } 
+
+  // Existing helper methods remain the same
+  // ...
+}
